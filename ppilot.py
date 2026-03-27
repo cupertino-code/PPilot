@@ -17,12 +17,12 @@ gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
 gi.require_version('Gtk', '3.0')
 
-from gi.repository import Gst, Gtk, Gdk
+from gi.repository import Gst, GstVideo, Gtk, Gdk
 
 GlobalLock = threading.Lock()
 OSD_Data = {}
 
-def thread_func(master):
+def mavlink_func(master):
     while True:
         msg = master.recv_match(blocking=True)
         if not msg:
@@ -41,6 +41,33 @@ def thread_func(master):
                     OSD_Data['fixed'] = fixed
                     OSD_Data['errs'] = rxerrs
 
+def wfb_func(addr, port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((addr, port))
+
+        buffer = ""
+        while True:
+            data = s.recv(4096).decode('utf-8')
+            if not data: continue
+
+            buffer += data
+            o = {}
+            try:
+                if "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    obj = json.loads(line)
+                    if obj.get('type') == 'rx':
+                        if len(obj['rx_ant_stats']) < 2:
+                            continue
+                        ant_val = {
+                            'rssi_0': obj['rx_ant_stats'][0]['rssi_avg'],
+                            'rssi_1': obj['rx_ant_stats'][1]['rssi_avg'],
+                            'snr_0': obj['rx_ant_stats'][0]['snr_avg'],
+                            'snr_1': obj['rx_ant_stats'][1]['snr_avg']
+                        }
+                        OSD_Data['rx_ant_stats'] = ant_val
+            except json.JSONDecodeError:
+                continue
 
 class X11Player:
     def __init__(self):
@@ -114,18 +141,18 @@ class X11Player:
                             self.last_bytes = total_bytes
                             self.last_time = now
             rect_width = 320
-            rect_height = 200
+            rect_height = 150
             margin = 20
 
             x = video_width - rect_width - margin
             y = margin
 
-            context.set_source_rgba(0, 0, 0, 0.6)
+            context.set_source_rgba(0, 0, 0, 0.4)
             context.rectangle(x, y, rect_width, rect_height)
             context.fill_preserve()
 
-            context.set_source_rgb(0, 1, 0.5)
-            context.set_line_width(2)
+#            context.set_source_rgb(0, 1, 0.5)
+#            context.set_line_width(2)
             context.stroke()
 
             context.set_source_rgb(1, 1, 1)
@@ -134,15 +161,17 @@ class X11Player:
 
             context.set_font_size(20)
             context.move_to(x + 15, y + 30)
-            context.show_text(f"RSSI: {OSD_Data['rssi']} SNR: {OSD_Data['SNR']}")
+            context.show_text(f"   {self.current_bitrate:.2f} Mbps   {OSD_Data['wifi_freq']}MHz")
             context.move_to(x + 15, y + 60)
-            context.show_text(f"Fixed: {OSD_Data['fixed']}")
-            context.move_to(x + 15, y + 90)
-            context.show_text(f"Errors: {OSD_Data['errs']}")
-            context.move_to(x + 15, y + 120)
-            context.show_text(f"Bitrate: {self.current_bitrate:.2f} Mbit/s")
-            context.move_to(x + 15, y + 150)
-            context.show_text(f"Chan: {OSD_Data['wifi_chan']} ({OSD_Data['wifi_freq']}MHz)")
+            context.show_text(f"             FEC F{OSD_Data['fixed']} L{OSD_Data['errs']}")
+            context.move_to(x + 15, y + 100)
+            rssi0 = OSD_Data['rx_ant_stats']['rssi_0']
+            rssi1 = OSD_Data['rx_ant_stats']['rssi_1']
+            snr0 = OSD_Data['rx_ant_stats']['snr_0']
+            snr1 = OSD_Data['rx_ant_stats']['snr_1']
+            context.show_text(f" {rssi0:3} RSSI {rssi1:3}  {snr0:3} SNR {snr1:3}")
+            context.move_to(x + 15, y + 130)
+            context.show_text(f"        {OSD_Data['rssi']:3}                 {OSD_Data['SNR']:}")
 
     def run(self):
         self.pipeline.set_state(Gst.State.PLAYING)
@@ -171,7 +200,8 @@ def get_freq_by_channel(channel):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        prog='ProgramName',                                                                                                                                                                                         description='What the program does',
+        prog='ProgramName',
+        description='What the program does',
         epilog='Text at the bottom of help')
     parser.add_argument('address', help="Destignation IP address")
     parser.add_argument('-p', '--wfb-port', default=DEFAULT_WFB_PORT, type=int,
@@ -199,12 +229,16 @@ if __name__ == "__main__":
                     break
             except json.JSONDecodeError:
                 break
+    OSD_Data['rx_ant_stats'] = []
     master = mavutil.mavlink_connection('udpin:0.0.0.0:14550')
-    thread = threading.Thread(target=thread_func, args=(master,))
-    thread.start()
+    thread_mavlink = threading.Thread(target=mavlink_func, args=(master,))
+    thread_mavlink.start()
+    thread_wfb = threading.Thread(target=wfb_func, args=(args.address, args.wfb_port,))
+    thread_wfb.start()
     try:
         player = X11Player()
         player.run()
     except Exception as e:
         print(f"Caught exception: {e}")
-    thread.join()
+    thread_mavlink.join()
+    thread_wfb.join()
