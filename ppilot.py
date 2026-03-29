@@ -1,3 +1,4 @@
+from fileinput import filename
 import os
 import sys
 import time
@@ -9,6 +10,7 @@ import socket
 from pymavlink import mavutil
 
 os.environ['GDK_BACKEND'] = 'x11'
+os.environ['GDK_DEBUG'] = '3'
 
 DEFAULT_WFB_PORT = 8103
 
@@ -17,13 +19,14 @@ gi.require_version('Gst', '1.0')
 gi.require_version('GstVideo', '1.0')
 gi.require_version('Gtk', '3.0')
 
-from gi.repository import Gst, GstVideo, Gtk, Gdk
+from gi.repository import Gst, Gtk, Gdk, GLib, GstVideo
 
 GlobalLock = threading.Lock()
 OSD_Data = {}
+do_exit = False
 
 def mavlink_func(master):
-    while True:
+    while not do_exit:
         msg = master.recv_match(blocking=True)
         if not msg:
             continue
@@ -42,16 +45,21 @@ def mavlink_func(master):
                     OSD_Data['errs'] = rxerrs
 
 def wfb_func(addr, port):
+    OSD_Data['rx_ant_stats'] = {
+        'rssi_0': 0,
+        'rssi_1': 0,
+        'snr_0': 0,
+        'snr_1': 0
+    }
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((addr, port))
 
         buffer = ""
-        while True:
+        while not do_exit:
             data = s.recv(4096).decode('utf-8')
             if not data: continue
 
             buffer += data
-            o = {}
             try:
                 if "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
@@ -59,15 +67,16 @@ def wfb_func(addr, port):
                     if obj.get('type') == 'rx':
                         if len(obj['rx_ant_stats']) < 2:
                             continue
-                        ant_val = {
-                            'rssi_0': obj['rx_ant_stats'][0]['rssi_avg'],
-                            'rssi_1': obj['rx_ant_stats'][1]['rssi_avg'],
-                            'snr_0': obj['rx_ant_stats'][0]['snr_avg'],
-                            'snr_1': obj['rx_ant_stats'][1]['snr_avg']
-                        }
-                        OSD_Data['rx_ant_stats'] = ant_val
+                        OSD_Data['rx_ant_stats']['rssi_0'] = obj['rx_ant_stats'][0]['rssi_avg']
+                        OSD_Data['rx_ant_stats']['rssi_1'] = obj['rx_ant_stats'][1]['rssi_avg']
+                        OSD_Data['rx_ant_stats']['snr_0'] = obj['rx_ant_stats'][0]['snr_avg']
+                        OSD_Data['rx_ant_stats']['snr_1'] = obj['rx_ant_stats'][1]['snr_avg']
             except json.JSONDecodeError:
                 continue
+
+class GstElementError(Exception):
+    def __init__(self, plugin):
+        super().__init__(f'No such element or plugin "{plugin}"')
 
 class X11Player:
     def __init__(self):
@@ -75,6 +84,7 @@ class X11Player:
 
         self.window = Gtk.Window(title="X11 Low Latency")
         self.window.connect("destroy", Gtk.main_quit)
+        self.window.connect("key-press-event", self.on_key_press)
         self.window.set_default_size(1280, 720)
 
         self.video_area = Gtk.DrawingArea()
@@ -89,7 +99,7 @@ class X11Player:
             "udpsrc port=5600 buffer-size=90000 name=source ! "
             "identity name=counter ! "
             "application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload=96 ! "
-            "rtph265depay ! h265parse ! avdec_h265 ! videoconvert ! "
+            "rtph265depay ! tee name=t ! queue ! h265parse ! avdec_h265 ! videoconvert ! "
             "video/x-raw,format=BGRx ! "
             "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=2 ! "
             "cairooverlay name=overlay ! "
@@ -115,14 +125,114 @@ class X11Player:
         self.current_bitrate = 0
         self.bytes_per_sec = 0
         self.last_bitrate_check = time.time()
+        self.recording_bin = None
+        self.record_pad = None
+        self.tee = self.pipeline.get_by_name("t")
         self.counter = self.pipeline.get_by_name("counter")
         if self.counter:
             self.counter.set_property("signal-handoffs", True)
 
+    def make_element(self, plugin, name):
+        element = Gst.ElementFactory.make(plugin, name)
+        if not element:
+            print(f'No such element or plugin "{plugin}"')
+            raise GstElementError(plugin)
+        return element
+
+    def on_key_press(self, widget, event):
+        global do_exit
+        keyname = Gdk.keyval_name(event.keyval)
+
+        if keyname == 'r' or keyname == 'R':
+            self.toggle_record()
+        elif keyname == 'q' or keyname == 'Q':
+            do_exit = True
+            Gtk.main_quit()
+
+    def toggle_record(self):
+        if self.recording_bin != None:
+            self.stop_recording()
+        else:
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            filename = f"recording_{timestamp}.mkv"
+            self.start_recording(filename)
+
+    def start_recording(self, filename):
+        if self.recording_bin:
+            return
+        self.rec_q = self.make_element("queue", "record_queue")
+        self.rec_parse = self.make_element("h265parse", "record_parse")
+        self.rec_mux = self.make_element("matroskamux", "record_mux")
+        self.rec_sink = self.make_element("filesink", "record_sink")
+
+        self.rec_sink.set_property("location", filename)
+        self.rec_sink.set_property("sync", False)
+        self.rec_parse.set_property("config-interval", -1)
+
+        elements = [self.rec_q, self.rec_parse, self.rec_mux, self.rec_sink]
+        for el in elements:
+            self.pipeline.add(el)
+
+        self.rec_q.link(self.rec_parse)
+        self.rec_parse.link(self.rec_mux)
+        self.rec_mux.link(self.rec_sink)
+
+        for el in elements:
+            el.sync_state_with_parent()
+
+        template = self.tee.get_pad_template("src_%u")
+        self.record_pad = self.tee.request_pad(template, None, None)
+
+        sink_pad = self.rec_q.get_static_pad("sink")
+        res = self.record_pad.link(sink_pad)
+
+        if res == Gst.PadLinkReturn.OK:
+            self.recording_bin = True
+            print(f"Recording: {filename}")
+        else:
+            print(f"Link error: {res}")
+            # Clean on error
+            self.tee.release_request_pad(self.record_pad)
+            self.pipeline.remove(self.rec_q)
+            self.rec_q = None
+            self.rec_parse = None
+            self.rec_mux = None
+            self.rec_sink = None
+
+    def stop_recording(self):
+        if not self.recording_bin:
+            return
+        self.record_pad.add_probe(Gst.PadProbeType.IDLE, self._on_pad_idle)
+
+    def _on_pad_idle(self, pad, info):
+        sink_pad = self.rec_q.get_static_pad("sink")
+        pad.unlink(sink_pad)
+        self.tee.release_request_pad(pad)
+
+        sink_pad.send_event(Gst.Event.new_eos())
+
+        GLib.timeout_add(200, self._finalize_recording)
+
+        self.record_pad = None
+        return Gst.PadProbeReturn.REMOVE
+
+    def _finalize_recording(self):
+        for el_name in ["record_queue", "record_parse", "record_mux", "record_sink"]:
+            el = self.pipeline.get_by_name(el_name)
+            if el:
+                el.set_state(Gst.State.NULL)
+                self.pipeline.remove(el)
+
+        self.recording_bin = None
+        print("Recording finalized and cleaned up.")
+        return False
+
     def on_draw(self, overlay, context, timestamp, duration):
         pad = overlay.get_static_pad("sink")
         caps = pad.get_current_caps()
-        if not caps: return
+        if not caps:
+            print("Can't get caps for overlay!")
+            return
 
         with GlobalLock:
             video_width = caps.get_structure(0).get_value("width")
@@ -140,8 +250,8 @@ class X11Player:
                             self.current_bitrate = (bytes_diff * 8) / (1024 * 1024 * dt)
                             self.last_bytes = total_bytes
                             self.last_time = now
-            rect_width = 320
-            rect_height = 150
+            rect_width = 330
+            rect_height = 180
             margin = 20
 
             x = video_width - rect_width - margin
@@ -150,28 +260,28 @@ class X11Player:
             context.set_source_rgba(0, 0, 0, 0.4)
             context.rectangle(x, y, rect_width, rect_height)
             context.fill_preserve()
-
-#            context.set_source_rgb(0, 1, 0.5)
-#            context.set_line_width(2)
             context.stroke()
 
-            context.set_source_rgb(1, 1, 1)
-            context.select_font_face("Sans", 0, 1)
-            context.set_font_size(16)
-
+            context.select_font_face("Courier New", 0, 1)
             context.set_font_size(20)
-            context.move_to(x + 15, y + 30)
-            context.show_text(f"   {self.current_bitrate:.2f} Mbps   {OSD_Data['wifi_freq']}MHz")
+            if self.recording_bin != None:
+                context.set_source_rgb(0.9, 0.1, 0.1)
+                context.move_to(x + 15, y + 30)
+                context.show_text(f"● REC")
+
+            context.set_source_rgb(1, 1, 1)
             context.move_to(x + 15, y + 60)
-            context.show_text(f"             FEC F{OSD_Data['fixed']} L{OSD_Data['errs']}")
-            context.move_to(x + 15, y + 100)
+            context.show_text(f"   {self.current_bitrate:.2f} Mbps   {OSD_Data['wifi_freq']}MHz")
+            context.move_to(x + 15, y + 90)
+            context.show_text(f"        FEC F{OSD_Data['fixed']} L{OSD_Data['errs']}")
+            context.move_to(x + 15, y + 130)
             rssi0 = OSD_Data['rx_ant_stats']['rssi_0']
             rssi1 = OSD_Data['rx_ant_stats']['rssi_1']
             snr0 = OSD_Data['rx_ant_stats']['snr_0']
             snr1 = OSD_Data['rx_ant_stats']['snr_1']
-            context.show_text(f" {rssi0:3} RSSI {rssi1:3}  {snr0:3} SNR {snr1:3}")
-            context.move_to(x + 15, y + 130)
-            context.show_text(f"        {OSD_Data['rssi']:3}                 {OSD_Data['SNR']:}")
+            context.show_text(f"{rssi0:3} RSSI {rssi1:3}  {snr0:3} SNR {snr1:3}")
+            context.move_to(x + 15, y + 160)
+            context.show_text(f"    {OSD_Data['rssi']:3}            {OSD_Data['SNR']:}")
 
     def run(self):
         self.pipeline.set_state(Gst.State.PLAYING)
@@ -240,5 +350,6 @@ if __name__ == "__main__":
         player.run()
     except Exception as e:
         print(f"Caught exception: {e}")
+    do_exit = True
     thread_mavlink.join()
     thread_wfb.join()
