@@ -127,8 +127,11 @@ class X11Player:
         self.last_bitrate_check = time.time()
         self.recording_bin = None
         self.record_pad = None
+        self.last_video_pts = 0
         self.tee = self.pipeline.get_by_name("t")
         self.counter = self.pipeline.get_by_name("counter")
+        tee_src_pad = self.tee.get_static_pad("src_0") # або будь-який активний пад
+        tee_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._timestamp_probe)
         if self.counter:
             self.counter.set_property("signal-handoffs", True)
 
@@ -198,6 +201,12 @@ class X11Player:
             self.rec_parse = None
             self.rec_mux = None
             self.rec_sink = None
+
+    def _timestamp_probe(self, pad, info):
+        buffer = info.get_buffer()
+        if buffer.pts != Gst.CLOCK_TIME_NONE:
+            self.last_video_pts = buffer.pts
+        return Gst.PadProbeReturn.OK
 
     def stop_recording(self):
         if not self.recording_bin:
