@@ -13,6 +13,7 @@ os.environ['GDK_BACKEND'] = 'x11'
 os.environ['GDK_DEBUG'] = '3'
 
 DEFAULT_WFB_PORT = 8103
+DEFAULT_VIDEO_PORT = 5600
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -80,7 +81,7 @@ class GstElementError(Exception):
         super().__init__(f'No such element or plugin "{plugin}"')
 
 class X11Player:
-    def __init__(self):
+    def __init__(self, video_port):
         Gst.init(None)
 
         self.window = Gtk.Window(title="X11 Low Latency")
@@ -95,9 +96,10 @@ class X11Player:
         self.window.fullscreen()
         self.video_area.realize()
         self.video_area.add_events(Gdk.EventMask.POINTER_MOTION_MASK)
+        self.video_port = video_port
 
         pipeline_str = (
-            "udpsrc port=5600 buffer-size=90000 name=source ! "
+            f"udpsrc port={self.video_port} buffer-size=90000 name=source ! "
             "identity name=counter ! "
             "application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload=96 ! "
             "rtph265depay ! tee name=t ! queue ! h265parse ! avdec_h265 ! videoconvert ! "
@@ -369,6 +371,8 @@ if __name__ == "__main__":
     parser.add_argument('address', help="Destignation IP address")
     parser.add_argument('-p', '--wfb-port', default=DEFAULT_WFB_PORT, type=int,
                         action='store', help='WFB port')
+    parser.add_argument('-v', '--video-port', default=DEFAULT_VIDEO_PORT, type=int,
+                        action='store', help='Video RTP port')
     args = parser.parse_args()
     OSD_Data = {'rssi': 0, 'noise': 0, 'SNR':0, 'fixed': 0, 'errs': 0,
                 'wifi_chan': 0, 'wifi_freq': 0}
@@ -399,7 +403,7 @@ if __name__ == "__main__":
     thread_wfb = threading.Thread(target=wfb_func, args=(args.address, args.wfb_port,))
     thread_wfb.start()
     try:
-        player = X11Player()
+        player = X11Player(video_port = args.video_port)
         player.run()
     except Exception as e:
         print(f"Caught exception: {e}")
