@@ -13,6 +13,7 @@ os.environ['GDK_BACKEND'] = 'x11'
 os.environ['GDK_DEBUG'] = '3'
 
 DEFAULT_WFB_PORT = 8103
+DEFAULT_RETR_PORT = 5000
 DEFAULT_VIDEO_PORT = 5600
 
 import gi
@@ -97,6 +98,7 @@ class X11Player:
         self.video_area.realize()
         self.video_area.add_events(Gdk.EventMask.POINTER_MOTION_MASK)
         self.video_port = video_port
+        print(f"Video port: {self.video_port}")
 
         pipeline_str = (
             f"udpsrc port={self.video_port} buffer-size=90000 name=source ! "
@@ -114,6 +116,7 @@ class X11Player:
         self.sink = self.pipeline.get_by_name("sink")
         self.last_bytes = 0
         self.last_time = time.time()
+        self.bus = self.pipeline.get_bus()
         gdk_window = self.video_area.get_window()
         if hasattr(gdk_window, 'get_xid'):
             xid = gdk_window.get_xid()
@@ -121,7 +124,8 @@ class X11Player:
         else:
             print("Error: Window has no XID even in X11 mode!")
             sys.exit(1)
-
+        self.bus.add_signal_watch()
+        self.bus.connect("message", self.on_message)
         overlay = self.pipeline.get_by_name("overlay")
         overlay.connect("draw", self.on_draw)
         self.last_bytes = 0
@@ -185,21 +189,26 @@ class X11Player:
         self.rec_sink.set_property("sync", False)
         self.rec_parse.set_property("config-interval", -1)
 
-        elements = [self.rec_q, self.rec_parse, self.rec_mux, self.rec_sink]
-        for el in elements:
+        self.rec_elements = [self.rec_q, self.rec_parse, self.rec_mux, self.rec_sink]
+        for el in self.rec_elements:
             self.pipeline.add(el)
 
         self.rec_q.link(self.rec_parse)
         self.rec_parse.link(self.rec_mux)
         self.rec_mux.link(self.rec_sink)
 
-        for el in elements:
+        for el in self.rec_elements:
             el.sync_state_with_parent()
 
         template = self.tee.get_pad_template("src_%u")
         self.record_pad = self.tee.request_pad(template, None, None)
 
         sink_pad = self.rec_q.get_static_pad("sink")
+        clock = self.pipeline.get_clock()
+        base_time = self.pipeline.get_base_time()
+        running_time = clock.get_time() - base_time - 0.1
+        sink_pad.set_offset(-running_time)
+        print(f"Офсет встановлено: -{running_time / 1e9} сек")
         res = self.record_pad.link(sink_pad)
 
         if res == Gst.PadLinkReturn.OK:
@@ -227,24 +236,48 @@ class X11Player:
         self.record_pad.add_probe(Gst.PadProbeType.IDLE, self._on_pad_idle)
 
     def _on_pad_idle(self, pad, info):
-        sink_pad = self.rec_q.get_static_pad("sink")
-        pad.unlink(sink_pad)
+        queue_pad = self.rec_q.get_static_pad("sink")
+        pad.unlink(queue_pad)
         self.tee.release_request_pad(pad)
 
-        sink_pad.send_event(Gst.Event.new_eos())
+        queue_pad.send_event(Gst.Event.new_eos())
+        sink_pad = self.pipeline.get_by_name("record_sink").get_static_pad("sink")
+        sink_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.on_pad_event)
 
-        GLib.timeout_add(200, self._finalize_recording)
-
-        self.record_pad = None
         return Gst.PadProbeReturn.REMOVE
 
+    def on_pad_event(self, pad, info):
+        event = info.get_event()
+        if event.type == Gst.EventType.EOS:
+            print("EOS went through filesink!")
+
+            GLib.idle_add(self._finalize_recording)
+
+            # Return DROP to stop EOS from proceeding (if necessary),
+            # or PASS to proceed as normal.
+            return Gst.PadProbeReturn.PASS
+
+        return Gst.PadProbeReturn.OK
+
+    def on_message(self, bus, message):
+        t = message.type
+        if t == Gst.MessageType.EOS:
+            print("Received EOS! File is now finalized.")
+        elif t == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            print(f"Error: {err}")
+        elif t == Gst.MessageType.STATE_CHANGED:
+            if message.src == self.pipeline:
+                old, new, pending = message.parse_state_changed()
+#                print(f"State changed from {old.value_nick} to {new.value_nick}")
+
     def _finalize_recording(self):
-        for el_name in ["record_queue", "record_parse", "record_mux", "record_sink"]:
-            el = self.pipeline.get_by_name(el_name)
+        for el in self.rec_elements:
             if el:
                 el.set_state(Gst.State.NULL)
                 self.pipeline.remove(el)
 
+        self.rec_elements = None
         self.recording_bin = None
         self.rec_start_time = 0
         if self.subtitle_file:
@@ -378,7 +411,7 @@ if __name__ == "__main__":
                 'wifi_chan': 0, 'wifi_freq': 0}
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.connect((args.address, args.wfb_port))
-        print("Підключено до сервера JSON")
+        print("Connected to JSON server")
 
         buffer = ""
         finish = 0
