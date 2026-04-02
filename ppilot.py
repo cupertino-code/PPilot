@@ -132,7 +132,7 @@ class X11Player:
         self.current_bitrate = 0
         self.bytes_per_sec = 0
         self.last_bitrate_check = time.time()
-        self.recording_bin = None
+        self.is_recording = None
         self.record_pad = None
         self.last_video_pts = 0
         self.subtitle_file = None
@@ -164,7 +164,7 @@ class X11Player:
             Gtk.main_quit()
 
     def toggle_record(self):
-        if self.recording_bin != None:
+        if self.is_recording != None:
             self.stop_recording()
         else:
             timestamp = time.strftime("%Y%m%d-%H%M%S")
@@ -178,7 +178,7 @@ class X11Player:
             self.start_recording(filename)
 
     def start_recording(self, filename):
-        if self.recording_bin:
+        if self.is_recording:
             return
         self.rec_q = self.make_element("queue", "record_queue")
         self.rec_parse = self.make_element("h265parse", "record_parse")
@@ -212,7 +212,7 @@ class X11Player:
         res = self.record_pad.link(sink_pad)
 
         if res == Gst.PadLinkReturn.OK:
-            self.recording_bin = True
+            self.is_recording = True
             print(f"Recording: {filename}")
         else:
             print(f"Link error: {res}")
@@ -231,7 +231,7 @@ class X11Player:
         return Gst.PadProbeReturn.OK
 
     def stop_recording(self):
-        if not self.recording_bin:
+        if not self.is_recording:
             return
         self.record_pad.add_probe(Gst.PadProbeType.IDLE, self._on_pad_idle)
 
@@ -278,7 +278,7 @@ class X11Player:
                 self.pipeline.remove(el)
 
         self.rec_elements = None
-        self.recording_bin = None
+        self.is_recording = None
         self.rec_start_time = 0
         if self.subtitle_file:
             self.subtitle_file.close()
@@ -323,7 +323,7 @@ class X11Player:
 
             context.select_font_face("Courier New", 0, 1)
             context.set_font_size(20)
-            if self.recording_bin != None:
+            if self.is_recording != None:
                 context.set_source_rgb(0.9, 0.1, 0.1)
                 context.move_to(x + 15, y + 30)
                 context.show_text(f"● REC")
