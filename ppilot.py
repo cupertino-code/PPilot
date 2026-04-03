@@ -242,10 +242,9 @@ class X11Player:
 
         pipeline_str = (
             f"udpsrc port={self.video_port} buffer-size=90000 name=source ! "
-            "identity name=counter ! "
             "application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload=96 ! "
-            "rtph265depay ! tee name=t ! queue ! h265parse ! avdec_h265 ! videoconvert ! "
-            "video/x-raw,format=BGRx ! "
+            "rtph265depay name=depay ! tee name=t ! queue ! h265parse ! avdec_h265 ! "
+            "videoconvert ! video/x-raw,format=BGRx ! "
             "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=2 ! "
             "cairooverlay name=overlay ! "
             "videoconvert ! "
@@ -270,8 +269,8 @@ class X11Player:
         overlay.connect("draw", self.on_draw)
         self.last_bytes = 0
         self.current_bitrate = 0
-        self.bytes_per_sec = 0
-        self.last_bitrate_check = time.time()
+        self.bytes_received = 0
+        self.last_bitrate_check_time = 0
         self.is_recording = None
         self.record_pad = None
         self.last_video_pts = 0
@@ -280,11 +279,7 @@ class X11Player:
         self.rec_last_time = 0
         self.srt_counter = 0
         self.tee = self.pipeline.get_by_name("t")
-        self.counter = self.pipeline.get_by_name("counter")
-        tee_src_pad = self.tee.get_static_pad("src_0") # або будь-який активний пад
-        tee_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._timestamp_probe)
-        if self.counter:
-            self.counter.set_property("signal-handoffs", True)
+        self.setup_bitrate_monitor()
 
         self.crsf_bridge = CRSFBridge()
         self.last_arm_state = False
@@ -296,6 +291,22 @@ class X11Player:
             print(f'No such element or plugin "{plugin}"')
             raise GstElementError(plugin)
         return element
+
+    def setup_bitrate_monitor(self):
+        depay_name = f"depay"
+        depay = self.pipeline.get_by_name(depay_name)
+
+        if depay:
+            sink_pad = depay.get_static_pad("sink")
+
+            sink_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                self.bitrate_probe,
+                None
+            )
+
+    def switch_to_stream(self, stream_index):
+        self.selector.set_property("active-pad", self.pad[stream_index])
 
     def on_key_press(self, widget, event):
         global do_exit
@@ -370,10 +381,27 @@ class X11Player:
             self.rec_mux = None
             self.rec_sink = None
 
-    def _timestamp_probe(self, pad, info):
+    def bitrate_probe(self, pad, info, userdata):
         buffer = info.get_buffer()
+        if not buffer:
+            return Gst.PadProbeReturn.OK
+
         if buffer.pts != Gst.CLOCK_TIME_NONE:
             self.last_video_pts = buffer.pts
+
+        self.bytes_received += buffer.get_size()
+
+        current_time = time.time()
+        elapsed = current_time - self.last_bitrate_check_time
+
+        if elapsed >= 1.0:
+            # Formula: (bytes * 8 bits) / (time in sec * 1000 * 1000 for Mbps)
+            bitrate = (self.bytes_received * 8) / (elapsed * 1000 * 1000) # Mbps
+            self.current_bitrate = bitrate
+
+            self.bytes_received = 0
+            self.last_bitrate_check_time = current_time
+
         return Gst.PadProbeReturn.OK
 
     def stop_recording(self):
@@ -453,45 +481,30 @@ class X11Player:
         if not caps:
             print("Can't get caps for overlay!")
             return
+        video_width = caps.get_structure(0).get_value("width")
+        rect_width = 330
+        rect_height = 180
+        margin = 20
 
+        x = video_width - rect_width - margin
+        y = margin
+
+        context.set_source_rgba(0, 0, 0, 0.4)
+        context.rectangle(x, y, rect_width, rect_height)
+        context.fill_preserve()
+        context.stroke()
+
+        context.select_font_face("Courier New", 0, 1)
+        context.set_font_size(20)
+        if self.is_recording != None:
+            context.set_source_rgb(0.9, 0.1, 0.1)
+            context.move_to(x + 15, y + 30)
+            context.show_text(f"● REC")
+            self.write_subtitle_frame()
+
+        context.set_source_rgb(1, 1, 1)
+        context.move_to(x + 15, y + 60)
         with GlobalLock:
-            video_width = caps.get_structure(0).get_value("width")
-            now = time.time()
-            dt = now - self.last_bitrate_check
-            if dt >= 1.0:
-                stats = self.counter.get_property("stats")
-                if stats:
-                    success, total_bytes = stats.get_uint64("num-bytes")
-                    if success:
-                        now = time.time()
-                        dt = now - self.last_time
-                        if dt > 0.5:
-                            bytes_diff = total_bytes - self.last_bytes
-                            self.current_bitrate = (bytes_diff * 8) / (1024 * 1024 * dt)
-                            self.last_bytes = total_bytes
-                            self.last_time = now
-            rect_width = 330
-            rect_height = 180
-            margin = 20
-
-            x = video_width - rect_width - margin
-            y = margin
-
-            context.set_source_rgba(0, 0, 0, 0.4)
-            context.rectangle(x, y, rect_width, rect_height)
-            context.fill_preserve()
-            context.stroke()
-
-            context.select_font_face("Courier New", 0, 1)
-            context.set_font_size(20)
-            if self.is_recording != None:
-                context.set_source_rgb(0.9, 0.1, 0.1)
-                context.move_to(x + 15, y + 30)
-                context.show_text(f"● REC")
-                self.write_subtitle_frame()
-
-            context.set_source_rgb(1, 1, 1)
-            context.move_to(x + 15, y + 60)
             context.show_text(f"   {self.current_bitrate:.2f} Mbps   {OSD_Data['wifi_freq']}MHz")
             context.move_to(x + 15, y + 90)
             context.show_text(f"        FEC F{OSD_Data['fixed']} L{OSD_Data['errs']}")
@@ -517,14 +530,15 @@ class X11Player:
         end = now + TELEMETRY_PERIOD
         if end - self.rec_last_time < TELEMETRY_PERIOD:
             return
-        rssi0 = OSD_Data['rx_ant_stats']['rssi_0']
-        snr0 = OSD_Data['rx_ant_stats']['snr_0']
-        rssi1 = OSD_Data['rx_ant_stats']['rssi_1']
-        snr1 = OSD_Data['rx_ant_stats']['snr_1']
-        text = f"{{\\an9}}<font size='18'>   {self.current_bitrate:.2f} Mbps   {OSD_Data['wifi_freq']}MHz\n"
-        text += f"        FEC F{OSD_Data['fixed']} L{OSD_Data['errs']}            \n"
-        text += f"{rssi0:3} RSSI {rssi1:3}  {snr0:3} SNR {snr1:3}\n"
-        text += f"    {OSD_Data['rssi']:3}            {OSD_Data['SNR']:3}     </font>"
+        with GlobalLock:
+            rssi0 = OSD_Data['rx_ant_stats']['rssi_0']
+            snr0 = OSD_Data['rx_ant_stats']['snr_0']
+            rssi1 = OSD_Data['rx_ant_stats']['rssi_1']
+            snr1 = OSD_Data['rx_ant_stats']['snr_1']
+            text = f"{{\\an9}}<font size='18'>   {self.current_bitrate:.2f} Mbps   {OSD_Data['wifi_freq']}MHz\n"
+            text += f"        FEC F{OSD_Data['fixed']} L{OSD_Data['errs']}            \n"
+            text += f"{rssi0:3} RSSI {rssi1:3}  {snr0:3} SNR {snr1:3}\n"
+            text += f"    {OSD_Data['rssi']:3}            {OSD_Data['SNR']:3}     </font>"
         self.subtitle_file.write(f"{self.srt_counter}\n")
         self.subtitle_file.write(f"{self.format_srt_time(now)} --> {self.format_srt_time(end)}\n")
         self.subtitle_file.write(f"{text}\n\n")
