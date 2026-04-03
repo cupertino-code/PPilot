@@ -288,6 +288,7 @@ class X11Player:
 
         self.crsf_bridge = CRSFBridge()
         self.last_arm_state = False
+        self.is_auto_record = False
 
     def make_element(self, plugin, name):
         element = Gst.ElementFactory.make(plugin, name)
@@ -379,6 +380,7 @@ class X11Player:
         if not self.is_recording:
             return
         self.record_pad.add_probe(Gst.PadProbeType.IDLE, self._on_pad_idle)
+        self.is_auto_record = False
 
     def _on_pad_idle(self, pad, info):
         queue_pad = self.rec_q.get_static_pad("sink")
@@ -438,9 +440,10 @@ class X11Player:
             current_arm_state = self.crsf_bridge.get_arm_state()
             if current_arm_state is True and self.last_arm_state is False:
                 self.start_recording()
+                self.is_auto_record = True
             self.last_arm_state = current_arm_state
         else:
-            if self.is_recording:
+            if self.is_recording and self.is_auto_record:
                 last_data_time = self.crsf_bridge.get_data_timestamp()
                 if time.time() - last_data_time > ACTUAL_DATA_LIFETIME_IN_SECONDS:
                     self.stop_recording()
