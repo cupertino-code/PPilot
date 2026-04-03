@@ -222,8 +222,47 @@ class GstElementError(Exception):
     def __init__(self, plugin):
         super().__init__(f'No such element or plugin "{plugin}"')
 
+class Stream:
+    index: int
+    video_file_name: str
+    subtitle_file: str
+    srt_counter: int
+    tee: Gst.Element
+    rec_start_time: float
+    rec_last_time: float
+    rec_q: Gst.Element
+    rec_parse: Gst.Element
+    rec_mux: Gst.Element
+    rec_sink: Gst.Element
+    rec_elements: list
+    last_bytes: int
+    current_bitrate: float
+    bytes_received: int
+    last_bitrate_check_time : float
+    record_pad: Gst.Pad
+    last_video_pts: float
+    def __init__(self):
+        self.index = 0
+        self.video_file_name = ""
+        self.subtitle_file = None
+        self.srt_counter = 1
+        self.tee = None
+        self.rec_start_time = 0.0
+        self.rec_last_time = 0.0
+        self.rec_q = None
+        self.rec_parse = None
+        self.rec_mux = None
+        self.rec_sink = None
+        self.rec_elements = []
+        self.last_bytes = 0
+        self.current_bitrate = 0.0
+        self.bytes_received = 0
+        self.last_bitrate_check_time = 0.0
+        self.record_pad = None
+        self.last_video_pts = 0.0
+
 class X11Player:
-    def __init__(self, video_port):
+    def __init__(self, video_port, retr_port):
         Gst.init(None)
 
         self.window = Gtk.Window(title="X11 Low Latency")
@@ -239,23 +278,29 @@ class X11Player:
         self.video_area.realize()
         self.video_area.add_events(Gdk.EventMask.POINTER_MOTION_MASK)
         self.video_port = video_port
-        print(f"Video port: {self.video_port}")
-
+        print(f"Video port: {self.video_port}, Retranslator port: {retr_port}")
         pipeline_str = (
-            f"udpsrc port={self.video_port} buffer-size=90000 name=source ! "
-            "application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload=96 ! "
-            "rtph265depay name=depay ! tee name=t ! queue ! h265parse ! avdec_h265 ! "
-            "videoconvert ! video/x-raw,format=BGRx ! "
+            "input-selector name=sel sync-streams=true ! videoconvert ! video/x-raw,format=BGRx ! "
             "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=2 ! "
-            "cairooverlay name=overlay ! "
-            "videoconvert ! "
-            "xvimagesink name=sink sync=false async=false"
+            "cairooverlay name=overlay ! videoconvert ! xvimagesink name=sink sync=false "
+
+            # Source 1 (Kamik)
+            f"udpsrc port={self.video_port} buffer-size=90000 name=source do-timestamp=true ! "
+            "application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload=96 ! "
+            "rtph265depay name=depay0 ! tee name=t0 ! queue leaky=2 max-size-buffers=3 ! "
+            "h265parse ! avdec_h265 ! videoconvert ! "
+            "sel.sink_0 "
+
+            # Source 2 (Retrik)
+            f"udpsrc port={retr_port} buffer-size=90000 ! "
+            "application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload=96 ! "
+            "rtph265depay name=depay1 ! tee name=t1 ! queue leaky=2 max-size-buffers=3 ! "
+            "h265parse ! avdec_h265 ! videoconvert ! "
+            "sel.sink_1"
         )
 
         self.pipeline = Gst.parse_launch(pipeline_str)
         self.sink = self.pipeline.get_by_name("sink")
-        self.last_bytes = 0
-        self.last_time = time.time()
         self.bus = self.pipeline.get_bus()
         gdk_window = self.video_area.get_window()
         if hasattr(gdk_window, 'get_xid'):
@@ -268,33 +313,32 @@ class X11Player:
         self.bus.connect("message", self.on_message)
         overlay = self.pipeline.get_by_name("overlay")
         overlay.connect("draw", self.on_draw)
-        self.last_bytes = 0
-        self.current_bitrate = 0
-        self.bytes_received = 0
-        self.last_bitrate_check_time = 0
         self.is_recording = None
-        self.record_pad = None
-        self.last_video_pts = 0
-        self.subtitle_file = None
-        self.rec_start_time = 0
-        self.rec_last_time = 0
-        self.srt_counter = 0
-        self.tee = self.pipeline.get_by_name("t")
-        self.setup_bitrate_monitor()
+        self.stream = [Stream(), Stream()]
+        self.stream[0].tee = self.pipeline.get_by_name("t0")
+        self.stream[1].tee = self.pipeline.get_by_name("t1")
+        self.stream[0].index = 0
+        self.stream[1].index = 1
+        self.setup_bitrate_monitor(self.stream[0])
+        self.setup_bitrate_monitor(self.stream[1])
+        self.selector = self.pipeline.get_by_name("sel")
+        self.pad = [self.selector.get_static_pad("sink_0"), self.selector.get_static_pad("sink_1")]
+        self.selector.set_property("active-pad", self.pad[0])
+        self.sel_index = 0
 
         self.crsf_bridge = CRSFBridge()
         self.last_arm_state = False
         self.is_auto_record = False
 
-    def make_element(self, plugin, name):
+    def make_element(self, plugin, name = None):
         element = Gst.ElementFactory.make(plugin, name)
         if not element:
             print(f'No such element or plugin "{plugin}"')
             raise GstElementError(plugin)
         return element
 
-    def setup_bitrate_monitor(self):
-        depay_name = f"depay"
+    def setup_bitrate_monitor(self, ctx):
+        depay_name = f"depay{ctx.index}"
         depay = self.pipeline.get_by_name(depay_name)
 
         if depay:
@@ -302,8 +346,8 @@ class X11Player:
 
             sink_pad.add_probe(
                 Gst.PadProbeType.BUFFER,
-                self.bitrate_probe,
-                None
+                self._bitrate_probe,
+                ctx
             )
 
     def switch_to_stream(self, stream_index):
@@ -318,6 +362,12 @@ class X11Player:
         elif keyname == 'q' or keyname == 'Q':
             do_exit = True
             Gtk.main_quit()
+        elif keyname == 's' or keyname == 'S':
+            if self.sel_index == 0:
+                self.sel_index = 1
+            else:
+                self.sel_index = 0
+            self.switch_to_stream(self.sel_index)
 
     def toggle_record(self):
         if self.is_recording != None:
@@ -328,46 +378,53 @@ class X11Player:
     def start_recording(self):
         if self.is_recording:
             return
-
         timestamp = time.strftime("%Y%m%d-%H%M%S")
-        filename = f"recording_{timestamp}"
+        self._do_start_recording(self.stream[0], timestamp)
+        self._do_start_recording(self.stream[1], timestamp)
+
+    def _do_start_recording(self, stream, timestamp):
+        if stream.index == 0:
+            stream_name = "kamik"
+        else:
+            stream_name = "retrik"
+        filename = f"{stream_name}_{timestamp}"
         srt_filename = filename + ".srt"
         filename += ".mkv"
-        self.subtitle_file = open(srt_filename, "w", encoding="utf-8")
-        self.rec_start_time = self.last_video_pts
-        self.srt_counter = 1
-        self.rec_last_time = 0
+        stream.video_file_name = filename
+        stream.subtitle_file = open(srt_filename, "w", encoding="utf-8")
+        stream.rec_start_time = stream.last_video_pts
+        stream.srt_counter = 1
+        stream.rec_last_time = 0.0
+        stream.rec_q = self.make_element("queue")
+        stream.rec_parse = self.make_element("h265parse")
+        stream.rec_mux = self.make_element("matroskamux")
+        stream.rec_sink = self.make_element("filesink", f"r{stream.index}")
 
-        self.rec_q = self.make_element("queue", "record_queue")
-        self.rec_parse = self.make_element("h265parse", "record_parse")
-        self.rec_mux = self.make_element("matroskamux", "record_mux")
-        self.rec_sink = self.make_element("filesink", "record_sink")
+        stream.rec_sink.set_property("location", filename)
+        stream.rec_sink.set_property("sync", False)
+        stream.rec_parse.set_property("config-interval", -1)
 
-        self.rec_sink.set_property("location", filename)
-        self.rec_sink.set_property("sync", False)
-        self.rec_parse.set_property("config-interval", -1)
-
-        self.rec_elements = [self.rec_q, self.rec_parse, self.rec_mux, self.rec_sink]
-        for el in self.rec_elements:
+        stream.rec_elements = [stream.rec_q, stream.rec_parse, stream.rec_mux, stream.rec_sink]
+        for el in stream.rec_elements:
             self.pipeline.add(el)
 
-        self.rec_q.link(self.rec_parse)
-        self.rec_parse.link(self.rec_mux)
-        self.rec_mux.link(self.rec_sink)
+        stream.rec_q.link(stream.rec_parse)
+        stream.rec_parse.link(stream.rec_mux)
+        stream.rec_mux.link(stream.rec_sink)
 
-        for el in self.rec_elements:
+        for el in stream.rec_elements:
             el.sync_state_with_parent()
 
-        template = self.tee.get_pad_template("src_%u")
-        self.record_pad = self.tee.request_pad(template, None, None)
+        template = stream.tee.get_pad_template("src_%u")
+        stream.record_pad = stream.tee.request_pad(template, None, None)
 
-        sink_pad = self.rec_q.get_static_pad("sink")
+        sink_pad = stream.rec_q.get_static_pad("sink")
         clock = self.pipeline.get_clock()
         base_time = self.pipeline.get_base_time()
         running_time = clock.get_time() - base_time - 0.1
         sink_pad.set_offset(-running_time)
-        print(f"Офсет встановлено: -{running_time / 1e9} сек")
-        res = self.record_pad.link(sink_pad)
+        print(f"Time offset: -{running_time / 1e9} сек")
+        res = stream.record_pad.link(sink_pad)
 
         if res == Gst.PadLinkReturn.OK:
             self.is_recording = True
@@ -375,59 +432,62 @@ class X11Player:
         else:
             print(f"Link error: {res}")
             # Clean on error
-            self.tee.release_request_pad(self.record_pad)
-            self.pipeline.remove(self.rec_q)
-            self.rec_q = None
-            self.rec_parse = None
-            self.rec_mux = None
-            self.rec_sink = None
+            stream.tee.release_request_pad(stream.record_pad)
+            self.pipeline.remove(stream.rec_q)
+            stream.rec_q = None
+            stream.rec_parse = None
+            stream.rec_mux = None
+            stream.rec_sink = None
+            stream.record_pad = None
+            stream.rec_elements = None
 
-    def bitrate_probe(self, pad, info, userdata):
+    def _bitrate_probe(self, pad, info, ctx):
         buffer = info.get_buffer()
         if not buffer:
             return Gst.PadProbeReturn.OK
 
         if buffer.pts != Gst.CLOCK_TIME_NONE:
-            self.last_video_pts = buffer.pts
-
-        self.bytes_received += buffer.get_size()
+            ctx.last_video_pts = buffer.pts
+        ctx.bytes_received += buffer.get_size()
 
         current_time = time.time()
-        elapsed = current_time - self.last_bitrate_check_time
+        elapsed = current_time - ctx.last_bitrate_check_time
 
+        # Calculate bitrate every second
         if elapsed >= 1.0:
             # Formula: (bytes * 8 bits) / (time in sec * 1000 * 1000 for Mbps)
-            bitrate = (self.bytes_received * 8) / (elapsed * 1000 * 1000) # Mbps
-            self.current_bitrate = bitrate
+            bitrate = (ctx.bytes_received * 8) / (elapsed * 1000 * 1000) # Mbps
+            ctx.current_bitrate = bitrate
 
-            self.bytes_received = 0
-            self.last_bitrate_check_time = current_time
+            ctx.bytes_received = 0
+            ctx.last_bitrate_check_time = current_time
 
         return Gst.PadProbeReturn.OK
 
     def stop_recording(self):
         if not self.is_recording:
             return
-        self.record_pad.add_probe(Gst.PadProbeType.IDLE, self._on_pad_idle)
         self.is_auto_record = False
+        self.stream[0].record_pad.add_probe(Gst.PadProbeType.IDLE, self._on_pad_idle, self.stream[0])
+        self.stream[1].record_pad.add_probe(Gst.PadProbeType.IDLE, self._on_pad_idle, self.stream[1])
 
-    def _on_pad_idle(self, pad, info):
-        queue_pad = self.rec_q.get_static_pad("sink")
+    def _on_pad_idle(self, pad, info, ctx):
+        queue_pad = ctx.rec_q.get_static_pad("sink")
         pad.unlink(queue_pad)
-        self.tee.release_request_pad(pad)
+        ctx.tee.release_request_pad(pad)
 
         queue_pad.send_event(Gst.Event.new_eos())
-        sink_pad = self.pipeline.get_by_name("record_sink").get_static_pad("sink")
-        sink_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self.on_pad_event)
+        sink_pad = ctx.rec_sink.get_static_pad("sink")
+        sink_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_pad_event, ctx)
 
         return Gst.PadProbeReturn.REMOVE
 
-    def on_pad_event(self, pad, info):
+    def _on_pad_event(self, pad, info, ctx):
         event = info.get_event()
         if event.type == Gst.EventType.EOS:
-            print("EOS went through filesink!")
+            print(f"EOS went through filesink! File {ctx.video_file_name} finalized")
 
-            GLib.idle_add(self._finalize_recording)
+            GLib.idle_add(self._finalize_recording, ctx)
 
             # Return DROP to stop EOS from proceeding (if necessary),
             # or PASS to proceed as normal.
@@ -438,7 +498,7 @@ class X11Player:
     def on_message(self, bus, message):
         t = message.type
         if t == Gst.MessageType.EOS:
-            print("Received EOS! File is now finalized.")
+            pass
         elif t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
             print(f"Error: {err}")
@@ -447,19 +507,19 @@ class X11Player:
                 old, new, pending = message.parse_state_changed()
 #                print(f"State changed from {old.value_nick} to {new.value_nick}")
 
-    def _finalize_recording(self):
-        for el in self.rec_elements:
+    def _finalize_recording(self, ctx):
+        self.is_recording = None
+        ctx.rec_start_time = 0.0
+        ctx.rec_last_time = 0.0
+        for el in ctx.rec_elements:
             if el:
                 el.set_state(Gst.State.NULL)
                 self.pipeline.remove(el)
-
-        self.rec_elements = None
-        self.is_recording = None
-        self.rec_start_time = 0
-        if self.subtitle_file:
-            self.subtitle_file.close()
-            self.subtitle_file = None
-        print("Recording finalized and cleaned up.")
+        ctx.rec_elements = None
+        if ctx.subtitle_file:
+            ctx.subtitle_file.close()
+            ctx.subtitle_file = None
+        print(f"Recording for stream {ctx.index} finalized and cleaned up.")
         return False
 
     def on_draw(self, overlay, context, timestamp, duration):
@@ -482,13 +542,15 @@ class X11Player:
         if not caps:
             print("Can't get caps for overlay!")
             return
+
         video_width = caps.get_structure(0).get_value("width")
         rect_width = 330
         rect_height = 180
         margin = 20
-
         x = video_width - rect_width - margin
         y = margin
+        index = self.sel_index
+        stream = self.stream[index]
 
         context.set_source_rgba(0, 0, 0, 0.4)
         context.rectangle(x, y, rect_width, rect_height)
@@ -501,12 +563,13 @@ class X11Player:
             context.set_source_rgb(0.9, 0.1, 0.1)
             context.move_to(x + 15, y + 30)
             context.show_text(f"● REC")
-            self.write_subtitle_frame()
+            self.write_subtitle_frame(self.stream[0])
+            self.write_subtitle_frame(self.stream[1])
 
         context.set_source_rgb(1, 1, 1)
-        context.move_to(x + 15, y + 60)
         with GlobalLock:
-            context.show_text(f"   {self.current_bitrate:.2f} Mbps   {OSD_Data['wifi_freq']}MHz")
+            context.move_to(x + 15, y + 60)
+            context.show_text(f"   {stream.current_bitrate:.2f} Mbps   {OSD_Data['wifi_freq']}MHz")
             context.move_to(x + 15, y + 90)
             context.show_text(f"        FEC F{OSD_Data['fixed']} L{OSD_Data['errs']}")
             context.move_to(x + 15, y + 130)
@@ -523,29 +586,29 @@ class X11Player:
         ms = int((seconds % 1) * 1000)
         return f"{time.strftime('%H:%M:%S', td)},{ms:03d}"
 
-    def write_subtitle_frame(self):
-        if not self.subtitle_file:
+    def write_subtitle_frame(self, ctx):
+        if not ctx.subtitle_file:
             return
 
-        now = (self.last_video_pts - self.rec_start_time) / Gst.SECOND
+        now = (ctx.last_video_pts - ctx.rec_start_time) / Gst.SECOND
         end = now + TELEMETRY_PERIOD
-        if end - self.rec_last_time < TELEMETRY_PERIOD:
+        if end - ctx.rec_last_time < TELEMETRY_PERIOD:
             return
         with GlobalLock:
             rssi0 = OSD_Data['rx_ant_stats']['rssi_0']
             snr0 = OSD_Data['rx_ant_stats']['snr_0']
             rssi1 = OSD_Data['rx_ant_stats']['rssi_1']
             snr1 = OSD_Data['rx_ant_stats']['snr_1']
-            text = f"{{\\an9}}<font size='18'>   {self.current_bitrate:.2f} Mbps   {OSD_Data['wifi_freq']}MHz\n"
+            text = f"{{\\an9}}<font size='18'>   {ctx.current_bitrate:.2f} Mbps   {OSD_Data['wifi_freq']}MHz\n"
             text += f"        FEC F{OSD_Data['fixed']} L{OSD_Data['errs']}            \n"
             text += f"{rssi0:3} RSSI {rssi1:3}  {snr0:3} SNR {snr1:3}\n"
             text += f"    {OSD_Data['rssi']:3}            {OSD_Data['SNR']:3}     </font>"
-        self.subtitle_file.write(f"{self.srt_counter}\n")
-        self.subtitle_file.write(f"{self.format_srt_time(now)} --> {self.format_srt_time(end)}\n")
-        self.subtitle_file.write(f"{text}\n\n")
-        self.subtitle_file.flush()
-        self.srt_counter += 1
-        self.rec_last_time = end
+        ctx.subtitle_file.write(f"{ctx.srt_counter}\n")
+        ctx.subtitle_file.write(f"{self.format_srt_time(now)} --> {self.format_srt_time(end)}\n")
+        ctx.subtitle_file.write(f"{text}\n\n")
+        ctx.subtitle_file.flush()
+        ctx.srt_counter += 1
+        ctx.rec_last_time = end
 
     def run(self):
         self.pipeline.set_state(Gst.State.PLAYING)
@@ -580,6 +643,8 @@ if __name__ == "__main__":
     parser.add_argument('address', help="Destignation IP address")
     parser.add_argument('-p', '--wfb-port', default=DEFAULT_WFB_PORT, type=int,
                         action='store', help='WFB port')
+    parser.add_argument('-r', '--retr-port', default=DEFAULT_RETR_PORT, type=int,
+                        action='store', help='Retranslator RTP port')
     parser.add_argument('-v', '--video-port', default=DEFAULT_VIDEO_PORT, type=int,
                         action='store', help='Video RTP port')
     args = parser.parse_args()
@@ -612,7 +677,7 @@ if __name__ == "__main__":
     thread_wfb = threading.Thread(target=wfb_func, args=(args.address, args.wfb_port,))
     thread_wfb.start()
     try:
-        player = X11Player(video_port = args.video_port)
+        player = X11Player(video_port = args.video_port, retr_port = args.retr_port)
         player.run()
     except Exception as e:
         print(f"Caught exception: {e}")
