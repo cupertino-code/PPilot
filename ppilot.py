@@ -8,6 +8,7 @@ import argparse
 import json
 import socket
 from pymavlink import mavutil
+import mmap
 
 os.environ['GDK_BACKEND'] = 'x11'
 os.environ['GDK_DEBUG'] = '3'
@@ -27,6 +28,143 @@ GlobalLock = threading.Lock()
 OSD_Data = {}
 do_exit = False
 TELEMETRY_PERIOD = 0.25
+
+SHM_NAME = "/channel_data"
+SHM_SIZE = 4096
+
+# Offsets within shared_buffer structure
+OFFSET_RECORDING = 0      # uint32_t recording
+OFFSET_CHANNELS = 4       # crsf_channels_t channels (22 bytes)
+OFFSET_FLAG = 26          # uint8_t flag (4 + 22 = 26)
+OFFSET_AUX = 27           # int aux
+OFFSET_NUM_CHANNELS = 31  # uint8_t num_channels
+OFFSET_BANDS = 32         # uint16_t bands
+
+# CRSF channel configuration
+NUM_CHANNELS = 16
+CHANNEL_VALUE_MIN = 172
+CHANNEL_VALUE_MAX = 1811
+CHANNEL_VALUE_MID = 992   # Threshold for switch detection
+
+ARM_CHANNEL_INDEX = 4
+
+class SharedMemoryReader:
+    """Simple shared memory reader - only opens memory and reads raw bytes."""
+
+    def __init__(self, shm_name: str = SHM_NAME, shm_size: int = SHM_SIZE):
+        self.shm_name = shm_name
+        self.shm_size = shm_size
+        self.shm_fd = None
+        self.mmap = None
+
+    def open(self) -> bool:
+        """Open the shared memory segment."""
+        try:
+            shm_path = self.shm_name
+            if not shm_path.startswith('/'):
+                shm_path = '/' + shm_path
+
+            self.shm_fd = os.open(f"/dev/shm{shm_path}", os.O_RDWR | os.O_CREAT)
+            self.mmap = mmap.mmap(self.shm_fd, self.shm_size, mmap.MAP_SHARED, mmap.PROT_WRITE)
+            print(f"Opened shared memory: {shm_path} ({self.shm_size} bytes)")
+            return True
+        except PermissionError:
+            print(f"Error: Permission denied accessing shared memory.")
+            print("Try running with sudo.")
+            return False
+        except Exception as e:
+            print(f"Error opening shared memory: {e}")
+            return False
+
+    def close(self):
+        """Close the shared memory segment."""
+        if self.mmap:
+            self.mmap.close()
+            self.mmap = None
+        if self.shm_fd is not None:
+            os.close(self.shm_fd)
+            self.shm_fd = None
+
+    def is_flag_set(self) -> bool:
+        """Read the flag byte from shared memory."""
+        if not self.mmap:
+            return False
+        return self.mmap[OFFSET_FLAG] == 1
+
+    def reset_flag(self):
+        """Assign zero value to the flag byte from shared memory."""
+        if not self.mmap:
+            return
+        self.mmap[OFFSET_FLAG] = 0
+
+    def read_bytes(self, offset: int, size: int) -> bytes:
+        """Read raw bytes from shared memory at given offset."""
+        if not self.mmap:
+            return b''
+        return bytes(self.mmap[offset:offset + size])
+
+class CRSFBridge:
+    """CRSF protocol parser"""
+
+    def __init__(self):
+        self._channels: list[int] = []
+        self.shm_reader = SharedMemoryReader(SHM_NAME)
+        if not self.shm_reader.open():
+            print("Failed to open shared memory")
+        self.data_timestamp = 0
+
+    def update_data(self):
+        """Parse 22 bytes of packed CRSF channel data into 16 channel values."""
+
+        if not self.shm_reader.is_flag_set():
+            return
+
+        size_of_channels_data = OFFSET_FLAG - OFFSET_CHANNELS
+        data = self.shm_reader.read_bytes(OFFSET_CHANNELS, size_of_channels_data)
+        if len(data) < size_of_channels_data:
+            return
+
+        channels = []
+        # 16 channels * 11 bits = 176 bits = 22 bytes
+        # Parse bit-packed data
+        bit_offset = 0
+        for i in range(NUM_CHANNELS):
+            byte_offset = bit_offset // 8
+            bit_in_byte = bit_offset % 8
+
+            # Read up to 3 bytes to get 11 bits
+            val = 0
+            for j in range(3):
+                if byte_offset + j < len(data):
+                    val |= data[byte_offset + j] << (j * 8)
+
+            # Extract 11 bits
+            val = (val >> bit_in_byte) & 0x7FF
+            channels.append(val)
+            bit_offset += 11
+
+        self._channels = channels
+        self.data_timestamp = time.time()
+        self.shm_reader.reset_flag()
+
+    def has_new_data(self) -> bool:
+        return self.shm_reader.is_flag_set()
+
+    def get_data_timestamp(self) -> float:
+        return self.data_timestamp
+
+    def get_channel_value(self, channel_index: int) -> int | None:
+        """Get value of a specific channel by index (0-15)."""
+        if 0 <= channel_index < len(self._channels):
+            return self._channels[channel_index]
+        return None
+
+    def get_arm_state(self) -> bool | None:
+        """Check if arm switch is engaged based on arm channel value."""
+        arm_value = self.get_channel_value(ARM_CHANNEL_INDEX)
+        if arm_value is None:
+            return None
+        return arm_value > CHANNEL_VALUE_MID
 
 def mavlink_func(master):
     while not do_exit:
@@ -145,6 +283,9 @@ class X11Player:
         tee_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._timestamp_probe)
         if self.counter:
             self.counter.set_property("signal-handoffs", True)
+
+        self.crsf_bridge = CRSFBridge()
+        self.last_arm_state = False
 
     def make_element(self, plugin, name):
         element = Gst.ElementFactory.make(plugin, name)
@@ -289,6 +430,14 @@ class X11Player:
         return False
 
     def on_draw(self, overlay, context, timestamp, duration):
+
+        if self.crsf_bridge.has_new_data():
+            self.crsf_bridge.update_data()
+            current_arm_state = self.crsf_bridge.get_arm_state()
+            if current_arm_state is True and self.last_arm_state is False:
+                self.start_recording()
+            self.last_arm_state = current_arm_state
+
         pad = overlay.get_static_pad("sink")
         caps = pad.get_current_caps()
         if not caps:
