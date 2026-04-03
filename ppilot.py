@@ -210,10 +210,11 @@ def wfb_func(addr, port):
                     if obj.get('type') == 'rx':
                         if len(obj['rx_ant_stats']) < 2:
                             continue
-                        OSD_Data['rx_ant_stats']['rssi_0'] = obj['rx_ant_stats'][0]['rssi_avg']
-                        OSD_Data['rx_ant_stats']['rssi_1'] = obj['rx_ant_stats'][1]['rssi_avg']
-                        OSD_Data['rx_ant_stats']['snr_0'] = obj['rx_ant_stats'][0]['snr_avg']
-                        OSD_Data['rx_ant_stats']['snr_1'] = obj['rx_ant_stats'][1]['snr_avg']
+                        with GlobalLock:
+                            OSD_Data['rx_ant_stats']['rssi_0'] = obj['rx_ant_stats'][0]['rssi_avg']
+                            OSD_Data['rx_ant_stats']['rssi_1'] = obj['rx_ant_stats'][1]['rssi_avg']
+                            OSD_Data['rx_ant_stats']['snr_0'] = obj['rx_ant_stats'][0]['snr_avg']
+                            OSD_Data['rx_ant_stats']['snr_1'] = obj['rx_ant_stats'][1]['snr_avg']
             except json.JSONDecodeError:
                 continue
 
