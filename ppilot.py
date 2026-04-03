@@ -167,19 +167,21 @@ class X11Player:
         if self.is_recording != None:
             self.stop_recording()
         else:
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            filename = f"recording_{timestamp}"
-            srt_filename = filename + ".srt"
-            filename += ".mkv"
-            self.subtitle_file = open(srt_filename, "w", encoding="utf-8")
-            self.rec_start_time = self.last_video_pts
-            self.srt_counter = 1
-            self.rec_last_time = 0
-            self.start_recording(filename)
+            self.start_recording()
 
-    def start_recording(self, filename):
+    def start_recording(self):
         if self.is_recording:
             return
+
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        filename = f"recording_{timestamp}"
+        srt_filename = filename + ".srt"
+        filename += ".mkv"
+        self.subtitle_file = open(srt_filename, "w", encoding="utf-8")
+        self.rec_start_time = self.last_video_pts
+        self.srt_counter = 1
+        self.rec_last_time = 0
+
         self.rec_q = self.make_element("queue", "record_queue")
         self.rec_parse = self.make_element("h265parse", "record_parse")
         self.rec_mux = self.make_element("matroskamux", "record_mux")
