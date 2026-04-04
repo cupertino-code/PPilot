@@ -241,6 +241,7 @@ class Stream:
     last_bitrate_check_time : float
     record_pad: Gst.Pad
     last_video_pts: float
+    is_recording: bool
     def __init__(self):
         self.index = 0
         self.video_file_name = ""
@@ -260,6 +261,7 @@ class Stream:
         self.last_bitrate_check_time = 0.0
         self.record_pad = None
         self.last_video_pts = 0.0
+        self.is_recording = False
 
 class X11Player:
     def __init__(self, video_port, retr_port):
@@ -313,7 +315,6 @@ class X11Player:
         self.bus.connect("message", self.on_message)
         overlay = self.pipeline.get_by_name("overlay")
         overlay.connect("draw", self.on_draw)
-        self.is_recording = None
         self.stream = [Stream(), Stream()]
         self.stream[0].tee = self.pipeline.get_by_name("t0")
         self.stream[1].tee = self.pipeline.get_by_name("t1")
@@ -329,6 +330,9 @@ class X11Player:
         self.crsf_bridge = CRSFBridge()
         self.last_arm_state = False
         self.is_auto_record = False
+
+    def is_recording(self):
+        return self.stream[0].is_recording or self.stream[1].is_recording
 
     def make_element(self, plugin, name = None):
         element = Gst.ElementFactory.make(plugin, name)
@@ -370,13 +374,13 @@ class X11Player:
             self.switch_to_stream(self.sel_index)
 
     def toggle_record(self):
-        if self.is_recording != None:
+        if self.is_recording():
             self.stop_recording()
         else:
             self.start_recording()
 
     def start_recording(self):
-        if self.is_recording:
+        if self.is_recording():
             return
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         self._do_start_recording(self.stream[0], timestamp)
@@ -427,7 +431,7 @@ class X11Player:
         res = stream.record_pad.link(sink_pad)
 
         if res == Gst.PadLinkReturn.OK:
-            self.is_recording = True
+            stream.is_recording = True
             print(f"Recording: {filename}")
         else:
             print(f"Link error: {res}")
@@ -465,7 +469,7 @@ class X11Player:
         return Gst.PadProbeReturn.OK
 
     def stop_recording(self):
-        if not self.is_recording:
+        if not self.is_recording():
             return
         self.is_auto_record = False
         self.stream[0].record_pad.add_probe(Gst.PadProbeType.IDLE, self._on_pad_idle, self.stream[0])
@@ -508,7 +512,7 @@ class X11Player:
 #                print(f"State changed from {old.value_nick} to {new.value_nick}")
 
     def _finalize_recording(self, ctx):
-        self.is_recording = None
+        ctx.is_recording = False
         ctx.rec_start_time = 0.0
         ctx.rec_last_time = 0.0
         for el in ctx.rec_elements:
@@ -532,7 +536,7 @@ class X11Player:
                 self.is_auto_record = True
             self.last_arm_state = current_arm_state
         else:
-            if self.is_recording and self.is_auto_record:
+            if self.is_recording() and self.is_auto_record:
                 last_data_time = self.crsf_bridge.get_data_timestamp()
                 if time.time() - last_data_time > ACTUAL_DATA_LIFETIME_IN_SECONDS:
                     self.stop_recording()
@@ -559,7 +563,7 @@ class X11Player:
 
         context.select_font_face("Courier New", 0, 1)
         context.set_font_size(20)
-        if self.is_recording != None:
+        if self.is_recording():
             context.set_source_rgb(0.9, 0.1, 0.1)
             context.move_to(x + 15, y + 30)
             context.show_text(f"● REC")
