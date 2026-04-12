@@ -9,6 +9,7 @@ import json
 import socket
 from pymavlink import mavutil
 import mmap
+import yaml
 
 os.environ['GDK_BACKEND'] = 'x11'
 os.environ['GDK_DEBUG'] = '3'
@@ -24,8 +25,6 @@ gi.require_version('Gtk', '3.0')
 
 from gi.repository import Gst, Gtk, Gdk, GLib, GstVideo
 
-GlobalLock = threading.Lock()
-OSD_Data = {}
 do_exit = False
 TELEMETRY_PERIOD = 0.25
 
@@ -168,62 +167,13 @@ class CRSFBridge:
             return None
         return arm_value > CHANNEL_VALUE_MID
 
-def mavlink_func(master):
-    while not do_exit:
-        msg = master.recv_match(blocking=True)
-        if not msg:
-            continue
-
-        if msg.get_type() != "BAD_DATA":
-            if msg.get_type() == 'RADIO_STATUS':
-                rssi = ctypes.c_int8(msg.rssi).value
-                noise = ctypes.c_int8(msg.noise).value
-                fixed = msg.fixed
-                rxerrs = msg.rxerrors
-                with GlobalLock:
-                    OSD_Data['rssi'] = rssi
-                    OSD_Data['noise'] = noise
-                    OSD_Data['SNR'] = abs(noise - rssi)
-                    OSD_Data['fixed'] = fixed
-                    OSD_Data['errs'] = rxerrs
-
-def wfb_func(addr, port):
-    OSD_Data['rx_ant_stats'] = {
-        'rssi_0': 0,
-        'rssi_1': 0,
-        'snr_0': 0,
-        'snr_1': 0
-    }
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((addr, port))
-
-        buffer = ""
-        while not do_exit:
-            data = s.recv(4096).decode('utf-8')
-            if not data: continue
-
-            buffer += data
-            try:
-                if "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    obj = json.loads(line)
-                    if obj.get('type') == 'rx':
-                        if len(obj['rx_ant_stats']) < 2:
-                            continue
-                        with GlobalLock:
-                            OSD_Data['rx_ant_stats']['rssi_0'] = obj['rx_ant_stats'][0]['rssi_avg']
-                            OSD_Data['rx_ant_stats']['rssi_1'] = obj['rx_ant_stats'][1]['rssi_avg']
-                            OSD_Data['rx_ant_stats']['snr_0'] = obj['rx_ant_stats'][0]['snr_avg']
-                            OSD_Data['rx_ant_stats']['snr_1'] = obj['rx_ant_stats'][1]['snr_avg']
-            except json.JSONDecodeError:
-                continue
-
 class GstElementError(Exception):
     def __init__(self, plugin):
         super().__init__(f'No such element or plugin "{plugin}"')
 
 class Stream:
     index: int
+    name: str
     video_file_name: str
     subtitle_file: str
     srt_counter: int
@@ -242,8 +192,15 @@ class Stream:
     record_pad: Gst.Pad
     last_video_pts: float
     is_recording: bool
+    wfb_thread: threading.Thread
+    wfb_addr: str
+    mavlink_thread: threading.Thread
+    mavlink_addr: str
+    video_port: int
+    osd_data: dict
     def __init__(self):
         self.index = 0
+        self.name = ""
         self.video_file_name = ""
         self.subtitle_file = None
         self.srt_counter = 1
@@ -262,9 +219,26 @@ class Stream:
         self.record_pad = None
         self.last_video_pts = 0.0
         self.is_recording = False
+        self.wfb_thread = None
+        self.wfb_addr = ""
+        self.mavlink_thread = None
+        self.mavlink_addr = ""
+        self.osd_data = {
+            'wifi_chan': 0,
+            'wifi_freq': 0,
+            'rssi_0': 0,
+            'rssi_1': 0,
+            'snr_0': 0,
+            'snr_1': 0,
+            'rssi': 0,
+            'noise': 0,
+            'SNR': 0,
+            'fixed': 0,
+            'errs': 0
+        }
 
 class X11Player:
-    def __init__(self, video_port, retr_port):
+    def __init__(self, config):
         Gst.init(None)
 
         self.window = Gtk.Window(title="X11 Low Latency")
@@ -279,22 +253,25 @@ class X11Player:
         self.window.fullscreen()
         self.video_area.realize()
         self.video_area.add_events(Gdk.EventMask.POINTER_MOTION_MASK)
-        self.video_port = video_port
-        print(f"Video port: {self.video_port}, Retranslator port: {retr_port}")
+        self.stream = [Stream(), Stream()]
+        self._setup_config(config['kamikadze'], self.stream[0])
+        self._setup_config(config['retranslator'], self.stream[1])
+        print(f"Video port: {self.stream[0].video_port},"
+              f" Retranslator port: {self.stream[1].video_port}")
         pipeline_str = (
             "input-selector name=sel sync-streams=true ! videoconvert ! video/x-raw,format=BGRx ! "
             "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=2 ! "
             "cairooverlay name=overlay ! videoconvert ! xvimagesink name=sink sync=false "
 
             # Source 1 (Kamik)
-            f"udpsrc port={self.video_port} buffer-size=90000 name=source do-timestamp=true ! "
+            f"udpsrc port={self.stream[0].video_port} buffer-size=90000 do-timestamp=true ! "
             "application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload=96 ! "
             "rtph265depay name=depay0 ! tee name=t0 ! queue leaky=2 max-size-buffers=3 ! "
             "h265parse ! avdec_h265 ! videoconvert ! "
             "sel.sink_0 "
 
             # Source 2 (Retrik)
-            f"udpsrc port={retr_port} buffer-size=90000 ! "
+            f"udpsrc port={self.stream[1].video_port} buffer-size=90000 ! "
             "application/x-rtp,media=video,clock-rate=90000,encoding-name=H265,payload=96 ! "
             "rtph265depay name=depay1 ! tee name=t1 ! queue leaky=2 max-size-buffers=3 ! "
             "h265parse ! avdec_h265 ! videoconvert ! "
@@ -315,11 +292,16 @@ class X11Player:
         self.bus.connect("message", self.on_message)
         overlay = self.pipeline.get_by_name("overlay")
         overlay.connect("draw", self.on_draw)
-        self.stream = [Stream(), Stream()]
         self.stream[0].tee = self.pipeline.get_by_name("t0")
         self.stream[1].tee = self.pipeline.get_by_name("t1")
         self.stream[0].index = 0
         self.stream[1].index = 1
+        self.stream[0].name = "kamik"
+        self.stream[1].name = "retrik"
+        self.start_wfb_thread(self.stream[0])
+        self.start_wfb_thread(self.stream[1])
+        self.start_mavlink_thread(self.stream[0])
+        self.start_mavlink_thread(self.stream[1])
         self.setup_bitrate_monitor(self.stream[0])
         self.setup_bitrate_monitor(self.stream[1])
         self.selector = self.pipeline.get_by_name("sel")
@@ -330,6 +312,100 @@ class X11Player:
         self.crsf_bridge = CRSFBridge()
         self.last_arm_state = False
         self.is_auto_record = False
+
+    def _setup_config(self, cfg, ctx):
+        ctx.wfb_addr = cfg.get('wfb-addr', "")
+        ctx.mavlink_addr = cfg.get('mavlink-addr', "")
+        ctx.video_port = int(cfg.get('video-port', 0))
+
+    def _wfb_thread_func(self, ctx):
+        try:
+            host, port = ctx.wfb_addr.split(":")
+        except ValueError:
+            print(f"{ctx.name}: Invalid WFB address format")
+            return
+        if port == None or port == "":
+            print(f"{ctx.name}: WFB address missing port")
+            return
+        port = int(port)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((host, port))
+
+            print(f"Connected to JSON server {host}:{port} for stream {ctx.name}")
+
+            buffer = ""
+            while True:
+                data = s.recv(4096).decode('utf-8')
+                if not data: break
+
+                buffer += data
+                try:
+                    if "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        obj = json.loads(line)
+                        ctx.osd_data['wifi_chan'] = obj['settings']['common']['wifi_channel']
+                        ctx.osd_data['wifi_freq'] = get_freq_by_channel(ctx.osd_data['wifi_chan'])
+                        break
+                except json.JSONDecodeError:
+                    break
+
+            buffer = ""
+            while not do_exit:
+                data = s.recv(4096).decode('utf-8')
+                if not data: continue
+
+                buffer += data
+                try:
+                    if "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        obj = json.loads(line)
+                        if obj.get('type') == 'rx':
+                            if len(obj['rx_ant_stats']) < 2:
+                                continue
+                            ctx.osd_data['rssi_0'] = obj['rx_ant_stats'][0]['rssi_avg']
+                            ctx.osd_data['rssi_1'] = obj['rx_ant_stats'][1]['rssi_avg']
+                            ctx.osd_data['snr_0'] = obj['rx_ant_stats'][0]['snr_avg']
+                            ctx.osd_data['snr_1'] = obj['rx_ant_stats'][1]['snr_avg']
+                except json.JSONDecodeError:
+                    continue
+
+    def start_wfb_thread(self, ctx):
+        ctx.wfb_thread = threading.Thread(
+            target=self._wfb_thread_func,
+            args=(ctx,),
+            daemon=True
+        )
+        ctx.wfb_thread.start()
+
+    def _mavlink_thread_func(self, ctx):
+        if ctx.mavlink_addr == "":
+            return
+        master = mavutil.mavlink_connection(ctx.mavlink_addr)
+        print(f"Started MAVLink thread for stream {ctx.name}, listening on {ctx.mavlink_addr}")
+        while not do_exit:
+            msg = master.recv_match(blocking=True)
+            if not msg:
+                continue
+
+            if msg.get_type() != "BAD_DATA":
+                if msg.get_type() == 'RADIO_STATUS':
+                    rssi = ctypes.c_int8(msg.rssi).value
+                    noise = ctypes.c_int8(msg.noise).value
+                    fixed = msg.fixed
+                    rxerrs = msg.rxerrors
+                    ctx.osd_data['rssi'] = rssi
+                    ctx.osd_data['noise'] = noise
+                    ctx.osd_data['SNR'] = abs(noise - rssi)
+                    ctx.osd_data['fixed'] = fixed
+                    ctx.osd_data['errs'] = rxerrs
+
+    def start_mavlink_thread(self, ctx):
+        ctx.mavlink_thread = threading.Thread(
+            target=self._mavlink_thread_func,
+            args=(ctx,),
+            daemon=True
+        )
+        ctx.mavlink_thread.start()
 
     def is_recording(self):
         return self.stream[0].is_recording or self.stream[1].is_recording
@@ -472,8 +548,10 @@ class X11Player:
         if not self.is_recording():
             return
         self.is_auto_record = False
-        self.stream[0].record_pad.add_probe(Gst.PadProbeType.IDLE, self._on_pad_idle, self.stream[0])
-        self.stream[1].record_pad.add_probe(Gst.PadProbeType.IDLE, self._on_pad_idle, self.stream[1])
+        self.stream[0].record_pad.add_probe(Gst.PadProbeType.IDLE,
+                                            self._on_pad_idle, self.stream[0])
+        self.stream[1].record_pad.add_probe(Gst.PadProbeType.IDLE,
+                                            self._on_pad_idle, self.stream[1])
 
     def _on_pad_idle(self, pad, info, ctx):
         queue_pad = ctx.rec_q.get_static_pad("sink")
@@ -571,19 +649,19 @@ class X11Player:
             self.write_subtitle_frame(self.stream[1])
 
         context.set_source_rgb(1, 1, 1)
-        with GlobalLock:
-            context.move_to(x + 15, y + 60)
-            context.show_text(f"   {stream.current_bitrate:.2f} Mbps   {OSD_Data['wifi_freq']}MHz")
-            context.move_to(x + 15, y + 90)
-            context.show_text(f"        FEC F{OSD_Data['fixed']} L{OSD_Data['errs']}")
-            context.move_to(x + 15, y + 130)
-            rssi0 = OSD_Data['rx_ant_stats']['rssi_0']
-            rssi1 = OSD_Data['rx_ant_stats']['rssi_1']
-            snr0 = OSD_Data['rx_ant_stats']['snr_0']
-            snr1 = OSD_Data['rx_ant_stats']['snr_1']
-            context.show_text(f"{rssi0:3} RSSI {rssi1:3}  {snr0:3} SNR {snr1:3}")
-            context.move_to(x + 15, y + 160)
-            context.show_text(f"    {OSD_Data['rssi']:3}            {OSD_Data['SNR']:}")
+        context.move_to(x + 100, y + 30)
+        context.show_text(f"   {stream.name}")
+        context.move_to(x + 15, y + 60)
+        context.show_text(f"   {stream.current_bitrate:.2f} Mbps"
+                          f"   {stream.osd_data['wifi_freq']}MHz")
+        context.move_to(x + 15, y + 90)
+        context.show_text(f"        FEC F{stream.osd_data['fixed']} L{stream.osd_data['errs']}")
+        context.move_to(x + 15, y + 130)
+        context.show_text(f"{stream.osd_data['rssi_0']:3} RSSI {stream.osd_data['rssi_1']:3}"
+                          f"  {stream.osd_data['snr_0']:3} SNR {stream.osd_data['snr_1']:3}")
+        context.move_to(x + 15, y + 160)
+        context.show_text(f"    {stream.osd_data['rssi']:3}"
+                          f"            {stream.osd_data['SNR']:3}     </font>")
 
     def format_srt_time(self, seconds):
         td = time.gmtime(seconds)
@@ -598,15 +676,15 @@ class X11Player:
         end = now + TELEMETRY_PERIOD
         if end - ctx.rec_last_time < TELEMETRY_PERIOD:
             return
-        with GlobalLock:
-            rssi0 = OSD_Data['rx_ant_stats']['rssi_0']
-            snr0 = OSD_Data['rx_ant_stats']['snr_0']
-            rssi1 = OSD_Data['rx_ant_stats']['rssi_1']
-            snr1 = OSD_Data['rx_ant_stats']['snr_1']
-            text = f"{{\\an9}}<font size='18'>   {ctx.current_bitrate:.2f} Mbps   {OSD_Data['wifi_freq']}MHz\n"
-            text += f"        FEC F{OSD_Data['fixed']} L{OSD_Data['errs']}            \n"
-            text += f"{rssi0:3} RSSI {rssi1:3}  {snr0:3} SNR {snr1:3}\n"
-            text += f"    {OSD_Data['rssi']:3}            {OSD_Data['SNR']:3}     </font>"
+        rssi0 = ctx.osd_data['rssi_0']
+        snr0 = ctx.osd_data['snr_0']
+        rssi1 = ctx.osd_data['rssi_1']
+        snr1 = ctx.osd_data['snr_1']
+        text = f"{{\\an9}}<font size='18'>   {ctx.current_bitrate:.2f} Mbps"
+        text += f"   {ctx.osd_data['wifi_freq']}MHz\n"
+        text += f"        FEC F{ctx.osd_data['fixed']} L{ctx.osd_data['errs']}            \n"
+        text += f"{rssi0:3} RSSI {rssi1:3}  {snr0:3} SNR {snr1:3}\n"
+        text += f"    {ctx.osd_data['rssi']:3}            {ctx.osd_data['SNR']:3}     </font>"
         ctx.subtitle_file.write(f"{ctx.srt_counter}\n")
         ctx.subtitle_file.write(f"{self.format_srt_time(now)} --> {self.format_srt_time(end)}\n")
         ctx.subtitle_file.write(f"{text}\n\n")
@@ -617,6 +695,13 @@ class X11Player:
     def run(self):
         self.pipeline.set_state(Gst.State.PLAYING)
         Gtk.main()
+        for ctx in self.stream:
+            print(f"Joining threads for stream {ctx.name}:")
+            print('Mavlink')
+            if ctx.mavlink_thread != None:   ctx.mavlink_thread.join()
+            print('WFB')
+            if ctx.wfb_thread != None:   ctx.wfb_thread.join()
+
 
 def get_freq_by_channel(channel):
     # 1. Band 2.4 GHz (Channels 1-13)
@@ -647,44 +732,18 @@ if __name__ == "__main__":
     parser.add_argument('address', help="Destignation IP address")
     parser.add_argument('-p', '--wfb-port', default=DEFAULT_WFB_PORT, type=int,
                         action='store', help='WFB port')
-    parser.add_argument('-r', '--retr-port', default=DEFAULT_RETR_PORT, type=int,
+    parser.add_argument('-r', '--retr-video-port', default=DEFAULT_RETR_PORT, type=int,
                         action='store', help='Retranslator RTP port')
-    parser.add_argument('-v', '--video-port', default=DEFAULT_VIDEO_PORT, type=int,
-                        action='store', help='Video RTP port')
+    parser.add_argument('-k', '--kamik-video-port', default=DEFAULT_VIDEO_PORT, type=int,
+                        action='store', help='Kamik RTP port')
     args = parser.parse_args()
-    OSD_Data = {'rssi': 0, 'noise': 0, 'SNR':0, 'fixed': 0, 'errs': 0,
-                'wifi_chan': 0, 'wifi_freq': 0}
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((args.address, args.wfb_port))
-        print("Connected to JSON server")
-
-        buffer = ""
-        finish = 0
-        while True:
-            data = s.recv(4096).decode('utf-8')
-            if not data: break
-
-            buffer += data
-            try:
-                if "\n" in buffer:
-                    line, buffer = buffer.split("\n", 1)
-                    obj = json.loads(line)
-                    OSD_Data['wifi_chan'] = obj['settings']['common']['wifi_channel']
-                    OSD_Data['wifi_freq'] = get_freq_by_channel(OSD_Data['wifi_chan'])
-                    break
-            except json.JSONDecodeError:
-                break
-    OSD_Data['rx_ant_stats'] = []
+    with open("ppilot.yaml", "r") as f:
+        config = yaml.safe_load(f)
+        print(config)
     master = mavutil.mavlink_connection('udpin:0.0.0.0:14550')
-    thread_mavlink = threading.Thread(target=mavlink_func, args=(master,))
-    thread_mavlink.start()
-    thread_wfb = threading.Thread(target=wfb_func, args=(args.address, args.wfb_port,))
-    thread_wfb.start()
     try:
-        player = X11Player(video_port = args.video_port, retr_port = args.retr_port)
+        player = X11Player(config = config)
         player.run()
     except Exception as e:
         print(f"Caught exception: {e}")
     do_exit = True
-    thread_mavlink.join()
-    thread_wfb.join()
